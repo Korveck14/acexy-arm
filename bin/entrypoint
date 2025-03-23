@@ -2,9 +2,11 @@
 set -e
 
 # Start the proxy. Acexy is located at "/acexy"
-/acexy &
+exec /acexy &
+ACEXY_PID=$!
 
-trap 'kill $(jobs -p)' EXIT INT TERM QUIT
+# Trap and clean up properly on exit signals
+trap 'kill -SIGTERM $ACEXY_PID; wait $ACEXY_PID' EXIT INT TERM QUIT
 
-# Wait for any of them to complete
-wait -n
+# Wait for Acexy to terminate
+wait $ACEXY_PID
