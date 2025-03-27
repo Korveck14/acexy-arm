@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build the application from source
-FROM golang:latest AS build-stage
+FROM golang:alpine AS build-stage
 
 WORKDIR /app
 COPY --link acexy/ ./
@@ -11,8 +11,12 @@ RUN rm -f go.mod go.sum && \
     go mod tidy && \
     go mod download
 
+# Install UPX
+RUN apk update && apk add --no-cache upx
+
 # Optimize the binary size by stripping debug info
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /acexy
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -ldflags="-s -w" -o /acexy && \
+    upx --best /acexy
 
 # Create a minimal image
 FROM alpine:latest AS final-stage
