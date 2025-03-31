@@ -1,30 +1,33 @@
 # syntax=docker/dockerfile:1
 
 # Build the application from source
-FROM --platform=$BUILDPLATFORM golang:1.22 AS build-stage
+FROM --platform=$BUILDPLATFORM golang:latest AS build-stage
 ARG  TARGETOS
 ARG  TARGETARCH
 
-WORKDIR     /app
+WORKDIR /app
 COPY --link acexy/ ./
 
-RUN go mod download
+RUN rm -f go.mod go.sum && \
+    go mod init javinator9889/acexy && \
+    go mod tidy && \
+    go mod download
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-s -w" -o /acexy
+# Optimize the binary size by stripping debug info
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /acexy
 
 # Create a minimal image
-FROM alpine:3.18 AS final-stage
+FROM alpine:latest AS final-stage
 
-COPY --from=build-stage /acexy         /acexy
+# Upgrade image packages
+RUN apk update && apk upgrade --no-cache && apk add --no-cache tini tzdata
+
+# Copy binary
+COPY --from=build-stage /acexy /acexy
+
+# Expose the application port
 EXPOSE 8080
-ENV ACEXY_LISTEN_ADDR=":8080"
-# USER acestream:acestream
 
-# Install curl for healthcheck
-RUN apk add --no-cache curl
-
-# Healthcheck against the HTTP status endpoint
-HEALTHCHECK --interval=10s --timeout=10s --start-period=1s \
-    CMD curl -qf http://localhost${ACEXY_LISTEN_ADDR}/ace/status || exit 1
-
-ENTRYPOINT [ "/acexy" ]
+# Set entrypoint
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/acexy"]

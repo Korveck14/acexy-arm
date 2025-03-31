@@ -29,6 +29,7 @@ var (
 	emptyTimeout      time.Duration
 	size              Size
 	noResponseTimeout time.Duration
+	noResponseRetries int
 )
 
 //go:embed LICENSE.short
@@ -95,14 +96,30 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// existing stream to the client. It takes an interface of `io.Writer` to write the stream
 	// contents to. The `http.ResponseWriter` implements the `io.Writer` interface, so we can
 	// pass it directly.
+	start := time.Now()
 	slog.Debug("Starting stream", "path", r.URL.Path, "id", aceId)
-	if err := p.Acexy.StartStream(stream, w); err != nil {
-		slog.Error("Failed to start stream", "stream", aceId, "error", err)
-		http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
-		return
+	for i := 0; i <= noResponseRetries; i++ {
+		err := p.Acexy.StartStream(stream, w)
+		if err != nil {
+			if i == noResponseRetries {
+				slog.Error("Failed to start stream", "stream", aceId, "error", err, "duration", time.Since(start))
+				http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			slog.Warn("Failed to start stream", "stream", aceId, "error", err, "retry", i+1)
+			stream, err = p.Acexy.FetchStream(aceId, q)
+			if err != nil {
+				slog.Error("Failed to start stream", "stream", aceId, "error", err)
+				http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			break // Exit loop if successful
+		}
 	}
 
 	// Update the client headers
+	slog.Info("Stream started", "id", aceId, "duration", time.Since(start))
 	w.WriteHeader(http.StatusOK)
 
 	// Defer the stream finish. This will be called when the request is done. When in M3U8 mode,
@@ -130,9 +147,9 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// And wait for the client to disconnect
 	select {
 	case <-r.Context().Done():
-		slog.Debug("Client disconnected", "path", r.URL.Path)
+		slog.Info("Client disconnected", "id", aceId, "duration", time.Since(start))
 	case <-p.Acexy.WaitStream(stream):
-		slog.Debug("Stream finished", "path", r.URL.Path)
+		slog.Info("Stream finished", "id", aceId, "duration", time.Since(start))
 	}
 }
 
@@ -320,6 +337,13 @@ func parseArgs() {
 		"timeout in human-readable format to wait for a response from the AceStream middleware. "+
 			"Can be set with ACEXY_NO_RESPONSE_TIMEOUT environment variable. "+
 			"Depending on the network conditions, you may want to adjust this value",
+	)
+	flag.IntVar(
+		&noResponseRetries,
+		"no-response-retries",
+		LookupEnvOrInt("ACEXY_NO_RESPONSE_RETRIES", 3),
+		"number of retries to wait for a response from the AceStream middleware. "+
+			"Can be set with ACEXY_NO_RESPONSE_RETRIES environment variable",
 	)
 	flag.Parse()
 }
