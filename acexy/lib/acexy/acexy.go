@@ -99,18 +99,17 @@ const (
 func (a *Acexy) Init() {
 	a.streams = make(map[AceID]*ongoingStream)
 	a.mutex = &sync.Mutex{}
-	// The transport to be used when connecting to the AceStream middleware. We have to tweak it
-	// a little bit to avoid compression and to limit the number of connections per host. Otherwise,
-	// the AceStream Middleware won't work.
+	// Reuse HTTP client with connection pooling
 	a.middleware = &http.Client{
 		Transport: &http.Transport{
 			DisableCompression:    true,
-			MaxIdleConns:          10,
-			MaxConnsPerHost:       10,
+			MaxIdleConns:          20,
+			MaxConnsPerHost:       20,
 			IdleConnTimeout:       30 * time.Second,
 			ResponseHeaderTimeout: a.NoResponseTimeout,
 			ExpectContinueTimeout: 1 * time.Second,
 		},
+		Timeout: 60 * time.Second, // Set a global timeout for requests
 	}
 }
 
@@ -318,18 +317,14 @@ func (a *Acexy) WaitStream(stream *AceStream) <-chan struct{} {
 // Returns the response from the AceStream backend. If the request fails, an error is returned.
 // If the `AceStreamMiddleware:error` field is not empty, an error is returned.
 func GetStream(a *Acexy, aceId AceID, extraParams url.Values) (*AceStreamMiddleware, error) {
-	slog.Debug("Getting stream", "id", aceId, "extraParams", extraParams)
-	slog.Debug("Acexy Information", "scheme", a.Scheme, "host", a.Host, "port", a.Port)
+	// Improved error handling
 	req, err := http.NewRequest("GET", a.Scheme+"://"+a.Host+":"+strconv.Itoa(a.Port)+string(a.Endpoint), nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Add the query parameters. We use a unique PID to identify the client accessing the stream.
-	// This prevents errors when multiple streams are accessed at the same time. Because of
-	// using the UUID package, we can be sure that the PID is unique.
+	// Add query parameters
 	pid := uuid.NewString()
-	slog.Debug("Temporary PID", "pid", pid, "stream", aceId)
 	if extraParams == nil {
 		extraParams = req.URL.Query()
 	}
@@ -337,37 +332,26 @@ func GetStream(a *Acexy, aceId AceID, extraParams url.Values) (*AceStreamMiddlew
 	extraParams.Set(string(idType), id)
 	extraParams.Set("format", "json")
 	extraParams.Set("pid", pid)
-	// and set the headers
-	req.Header.Set("Content-Type", "application/json")
 	req.URL.RawQuery = extraParams.Encode()
 
-	slog.Debug("Request URL", "url", req.URL.String())
-	client := &http.Client{}
-	res, err := client.Do(req)
+	res, err := a.middleware.Do(req)
 	if err != nil {
-		slog.Debug("Error getting stream", "error", err)
-		return nil, err
+		return nil, fmt.Errorf("failed to perform request: %w", err)
 	}
-	slog.Debug("Stream response", "statusCode", res.StatusCode, "headers", res.Header, "res", res)
 	defer res.Body.Close()
 
-	// Read the response into the body
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		slog.Debug("Error reading stream response", "error", err)
-		return nil, err
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	slog.Debug("Stream response", "response", string(body))
 	var response AceStreamMiddleware
 	if err := json.Unmarshal(body, &response); err != nil {
-		slog.Debug("Error unmarshalling stream response", "error", err)
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
 	if response.Error != "" {
-		slog.Debug("Error in stream response", "error", response.Error)
-		return nil, errors.New(response.Error)
+		return nil, fmt.Errorf("error from AceStream: %s", response.Error)
 	}
 	return &response, nil
 }

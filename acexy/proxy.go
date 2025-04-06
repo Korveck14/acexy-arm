@@ -13,7 +13,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+	"context"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -47,6 +50,12 @@ type Size struct {
 	Default uint64
 }
 
+// Centralized error response function
+func respondWithError(w http.ResponseWriter, statusCode int, message string, err error) {
+	slog.Error(message, "error", err)
+	http.Error(w, message, statusCode)
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case APIv1_URL + "/getstream":
@@ -63,8 +72,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// Verify the request method
 	if r.Method != http.MethodGet {
-		slog.Error("Method not allowed", "method", r.Method, "path", r.URL.Path)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		respondWithError(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
 
@@ -72,23 +80,26 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// Verify the client has included the ID parameter
 	aceId, err := acexy.NewAceID(q.Get("id"), q.Get("infohash"))
 	if err != nil {
-		slog.Error("ID parameter is required", "path", r.URL.Path, "error", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		respondWithError(w, http.StatusBadRequest, "Invalid ID parameter", err)
+		return
+	}
+
+	// Additional validation for query parameters
+	if len(aceId.String()) > 100 {
+		respondWithError(w, http.StatusBadRequest, "ID parameter too long", nil)
 		return
 	}
 
 	// Verify the client has not included the PID parameter
 	if q.Has("pid") {
-		slog.Error("PID parameter is not allowed", "path", r.URL.Path)
-		http.Error(w, "PID parameter is not allowed", http.StatusBadRequest)
+		respondWithError(w, http.StatusBadRequest, "PID parameter is not allowed", nil)
 		return
 	}
 
 	// Gather the stream information
 	stream, err := p.Acexy.FetchStream(aceId, q)
 	if err != nil {
-		slog.Error("Failed to start stream", "stream", aceId, "error", err)
-		http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to start stream", err)
 		return
 	}
 
@@ -102,15 +113,13 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 		err := p.Acexy.StartStream(stream, w)
 		if err != nil {
 			if i == noResponseRetries {
-				slog.Error("Failed to start stream", "stream", aceId, "error", err, "duration", time.Since(start))
-				http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
+				respondWithError(w, http.StatusInternalServerError, "Failed to start stream", err)
 				return
 			}
 			slog.Warn("Failed to start stream", "stream", aceId, "error", err, "retry", i+1)
 			stream, err = p.Acexy.FetchStream(aceId, q)
 			if err != nil {
-				slog.Error("Failed to start stream", "stream", aceId, "error", err)
-				http.Error(w, "Failed to start stream: "+err.Error(), http.StatusInternalServerError)
+				respondWithError(w, http.StatusInternalServerError, "Failed to start stream", err)
 				return
 			}
 		} else {
@@ -155,8 +164,7 @@ func (p *Proxy) HandleStream(w http.ResponseWriter, r *http.Request) {
 
 func (p *Proxy) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		slog.Error("Method not allowed", "method", r.Method, "path", r.URL.Path)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		respondWithError(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
 
@@ -175,8 +183,7 @@ func (p *Proxy) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("Getting status", "id", aceId)
 	status, err := p.Acexy.GetStatus(aceId)
 	if err != nil {
-		slog.Error("Failed to get status", "error", err)
-		http.Error(w, "Stream not found", http.StatusNotFound)
+		respondWithError(w, http.StatusNotFound, "Stream not found", err)
 		return
 	}
 
@@ -186,8 +193,7 @@ func (p *Proxy) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	if err := json.NewEncoder(w).Encode(status); err != nil {
-		slog.Error("Failed to write status", "error", err)
-		http.Error(w, "Failed to write status", http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to write status", err)
 		return
 	}
 }
@@ -341,7 +347,7 @@ func parseArgs() {
 	flag.IntVar(
 		&noResponseRetries,
 		"no-response-retries",
-		LookupEnvOrInt("ACEXY_NO_RESPONSE_RETRIES", 3),
+		LookupEnvOrInt("ACEXY_NO_RESPONSE_RETRIES", 0),
 		"number of retries to wait for a response from the AceStream middleware. "+
 			"Can be set with ACEXY_NO_RESPONSE_RETRIES environment variable",
 	)
@@ -379,12 +385,35 @@ func main() {
 	mux.Handle(APIv1_URL+"/getstream", proxy)
 	mux.Handle(APIv1_URL+"/getstream/", proxy)
 	mux.Handle(APIv1_URL+"/status", proxy)
+	mux.Handle("/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	}))
 	mux.Handle("/", http.NotFoundHandler())
 
-	// Start the HTTP server
-	slog.Info("Starting server", "addr", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		slog.Error("Failed to start server", "error", err)
-		os.Exit(1)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
+
+	// Handle graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		slog.Info("Starting server", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Failed to start server", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-stop
+	slog.Info("Shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		slog.Error("Server forced to shutdown", "error", err)
+	}
+	slog.Info("Server stopped gracefully")
 }

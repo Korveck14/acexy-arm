@@ -2,6 +2,8 @@ package acexy
 
 import (
 	"bufio"
+	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"time"
@@ -19,6 +21,8 @@ type Copier struct {
 	EmptyTimeout time.Duration
 	// The buffer size to use when copying the data.
 	BufferSize int
+	// Context for cancellation.
+	Context context.Context
 
 	/**! Private Data */
 	timer          *time.Timer
@@ -29,34 +33,50 @@ type Copier struct {
 func (c *Copier) Copy() error {
 	c.bufferedWriter = bufio.NewWriterSize(c.Destination, c.BufferSize)
 	c.timer = time.NewTimer(c.EmptyTimeout)
+	defer func() {
+		c.bufferedWriter.Flush()
+		if !c.timer.Stop() {
+			<-c.timer.C // Drain the timer channel
+		}
+	}()
+
 	done := make(chan struct{})
 	defer close(done)
 
 	go func() {
-		for {
-			c.timer.Reset(c.EmptyTimeout)
-			select {
-			case <-done:
-				slog.Debug("Done copying", "source", c.Source, "destination", c.Destination)
-				return
-			case <-c.timer.C:
-				// On timeout, flush the buffer, and close both the source and the destination
-				c.bufferedWriter.Flush()
-				if closer, ok := c.Source.(io.Closer); ok {
-					slog.Debug("Closing source", "source", c.Source)
-					closer.Close()
-				}
-				if closer, ok := c.Destination.(io.Closer); ok {
-					slog.Debug("Closing destination", "destination", c.Destination)
-					closer.Close()
-				}
-				return
+		select {
+		case <-done:
+			slog.Debug("Done copying", "source", c.Source, "destination", c.Destination)
+			return
+		case <-c.Context.Done():
+			slog.Warn("Copy canceled", "error", c.Context.Err())
+			c.bufferedWriter.Flush()
+			if closer, ok := c.Source.(io.Closer); ok {
+				closer.Close()
 			}
+			if closer, ok := c.Destination.(io.Closer); ok {
+				closer.Close()
+			}
+			return
+		case <-c.timer.C:
+			slog.Warn("Copy timeout reached", "source", c.Source, "destination", c.Destination)
+			c.bufferedWriter.Flush()
+			if closer, ok := c.Source.(io.Closer); ok {
+				closer.Close()
+			}
+			if closer, ok := c.Destination.(io.Closer); ok {
+				closer.Close()
+			}
+			return
 		}
 	}()
 
 	_, err := io.Copy(c, c.Source)
-	return err
+	if err != nil {
+		slog.Error("Error during copy", "error", err)
+		return fmt.Errorf("copy failed: %w", err)
+	}
+	return nil
 }
 
 // Write writes the data to the destination. It also resets the timer if there is data to write.

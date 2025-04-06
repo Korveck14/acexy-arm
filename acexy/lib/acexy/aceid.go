@@ -18,10 +18,10 @@ type AceIDType string
 // Create a new `AceID` object
 func NewAceID(id, infohash string) (AceID, error) {
 	if id == "" && infohash == "" {
-		return AceID{}, errors.New("one of `id` or `infohash` must have a value")
+		return AceID{}, errors.New("either `id` or `infohash` must be provided")
 	}
 	if id != "" && infohash != "" {
-		return AceID{}, errors.New("only one of `id` or `infohash` can have a value")
+		return AceID{}, errors.New("only one of `id` or `infohash` can be provided, not both")
 	}
 	return AceID{id: id, infohash: infohash}, nil
 }
